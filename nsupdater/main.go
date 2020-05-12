@@ -75,11 +75,11 @@ func parseBindKey(keyFilePath string) (tsig TSIG, err error) {
 
 	switch tsigString[2] {
 	case "hmac-md5":
-		tsig = TSIG{tsigString[1], "hmac-md5.sig-alg.reg.int.", tsigString[3]}
+		tsig = TSIG{dns.Fqdn(tsigString[1]), "hmac-md5.sig-alg.reg.int.", tsigString[3]}
 	case "hmac-sha1":
-		tsig = TSIG{tsigString[1], "hmac-sha1.", tsigString[3]}
+		tsig = TSIG{dns.Fqdn(tsigString[1]), "hmac-sha1.", tsigString[3]}
 	case "hmac-sha256":
-		tsig = TSIG{tsigString[1], "hmac-sha256.", tsigString[3]}
+		tsig = TSIG{dns.Fqdn(tsigString[1]), "hmac-sha256.", tsigString[3]}
 	}
 	return
 }
@@ -107,6 +107,27 @@ func getDefautHostname() (hostname string) {
 	return hostname
 }
 
+func (d *DNSProvider) zoneTransfer() (err error) {
+	t := new(dns.Transfer)
+	m := new(dns.Msg)
+
+	t.TsigSecret = map[string]string{d.config.TSIG.TSIGKey: d.config.TSIG.TSIGSecret}
+	m.SetAxfr(d.config.Zone)
+	if len(d.config.TSIG.TSIGKey) > 0 {
+		m.SetTsig(d.config.TSIG.TSIGKey, d.config.TSIG.TSIGAlgorithm, 300, time.Now().Unix())
+	}
+	zone, err := t.In(m, d.config.Nameserver)
+	for record := range zone {
+		for _, entry := range record.RR {
+			//		fmt.Printf("%T\n", record.RR)
+			if entry.Header().Rrtype != dns.TypeSOA {
+				fmt.Printf("%+v\n", entry)
+			}
+		}
+	}
+	return
+}
+
 func (d *DNSProvider) changeRecord() error {
 	zone := d.config.Zone
 	fqdn := d.config.Hostname
@@ -130,9 +151,9 @@ func (d *DNSProvider) changeRecord() error {
 	c.SingleInflight = true
 
 	// TSIG authentication / msg signing
-	if len(d.config.TSIG.TSIGKey) > 0 && len(d.config.TSIG.TSIGSecret) > 0 {
-		m.SetTsig(dns.Fqdn(d.config.TSIG.TSIGKey), d.config.TSIG.TSIGAlgorithm, 300, time.Now().Unix())
-		c.TsigSecret = map[string]string{dns.Fqdn(d.config.TSIG.TSIGKey): d.config.TSIG.TSIGSecret}
+	if len(d.config.TSIG.TSIGKey) > 0 {
+		m.SetTsig(d.config.TSIG.TSIGKey, d.config.TSIG.TSIGAlgorithm, 300, time.Now().Unix())
+		c.TsigSecret = map[string]string{d.config.TSIG.TSIGKey: d.config.TSIG.TSIGSecret}
 	}
 
 	// Send the query
@@ -147,7 +168,7 @@ func (d *DNSProvider) changeRecord() error {
 	return nil
 }
 
-func sanitizeConfig(action string, ip string, hostname string, zone string, nameserver string, nsPort int, tsigFile string, ttl int) (config Config, err error) {
+func sanitizeConfig(action string, ip string, hostname string, zone string, zoneFile string, nameserver string, nsPort int, tsigFile string, ttl int) (config Config, err error) {
 	if !(stringInSlice(action, []string{"add", "delete", "update"})) {
 		err = errors.New("Action, either 'add', 'delete' or 'update' [default: update]")
 	}
@@ -155,11 +176,18 @@ func sanitizeConfig(action string, ip string, hostname string, zone string, name
 	if ipAddr == nil {
 		err = fmt.Errorf("ip: %q is not a valid IPv4 IP", ip)
 	}
-	if config.Hostname == "" {
+	if hostname == "" {
 		err = errors.New("could not get hostname")
 	}
-	if config.Zone == "" {
+	if zone == "" {
 		err = errors.New("Set a zone [--zone ] or env NSUPDATE_ZONE")
+	}
+	if nameserver == "" {
+		var ok bool
+		nameserver, ok = os.LookupEnv("NSUPDATE_NAMESERVER")
+		if !ok {
+			nameserver = "127.0.0.1"
+		}
 	}
 	if i := net.ParseIP(nameserver); i != nil {
 		nameserver = net.JoinHostPort(nameserver, strconv.Itoa(nsPort))
@@ -187,24 +215,26 @@ func main() {
 		nsPort     int
 		zone       string
 		tsigFile   string
+		zoneFile   string
 		ttl        int
 		debug      bool
 		err        error
 	)
 
-	flag.StringVar(&action, "action", "update", "Action, either 'add', 'delete' or 'update' [default: update]")
+	flag.StringVar(&action, "action", "update", "Action, right now only 'update' should support also 'add' and 'delete' [default: update]")
 	flag.StringVar(&ip, "ip", getDefaultIP(), "Client IP Adress")
 	flag.StringVar(&hostname, "hostname", getDefautHostname(), "Client Hostname")
-	flag.StringVar(&nameserver, "nameserver", "127.0.0.1", "Nameserver to send the update to [default: 127.0.0.1]")
-	flag.IntVar(&nsPort, "nsport", 53, "Port of the Nameserver to send the update to [default: 53]")
 	flag.StringVar(&zone, "zone", os.Getenv("NSUPDATE_ZONE"), "DNS Zone to Add A Record for the Client")
+	flag.StringVar(&zoneFile, "zoneFile", "", "Zonefile to Update the zone from")
+	flag.StringVar(&nameserver, "nameserver", "", "Nameserver to send the update to [default: 127.0.0.1]")
+	flag.IntVar(&nsPort, "nsport", 53, "Port of the Nameserver to send the update to [default: 53]")
 	flag.IntVar(&ttl, "ttl", 600, "RR TTL")
 	flag.StringVar(&tsigFile, "tsigFile", "/etc/rndc.key", "File holding the tsig key")
 
 	flag.BoolVar(&debug, "debug", false, "Run in Debug mode")
 	flag.Parse()
 
-	config, err := sanitizeConfig(action, ip, hostname, zone, nameserver, nsPort, tsigFile, ttl)
+	config, err := sanitizeConfig(action, ip, hostname, zone, zoneFile, nameserver, nsPort, tsigFile, ttl)
 	if err != nil {
 		panic(err)
 	}
@@ -218,6 +248,7 @@ func main() {
 	}
 
 	err = dnsclient.changeRecord()
+	//err = dnsclient.zoneTransfer()
 	if err != nil {
 		panic(err)
 	}

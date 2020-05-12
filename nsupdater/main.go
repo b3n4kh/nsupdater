@@ -1,13 +1,13 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -16,28 +16,30 @@ import (
 
 // TSIG (Transaction SIGnatures) as specified in RFC 2845
 type TSIG struct {
-	TSIGAlgorithm string
 	TSIGKey       string
+	TSIGAlgorithm string
 	TSIGSecret    string
 }
 
 // Config is the structure of the global Configuration object
 type Config struct {
-	Action      string
-	IP          string
-	Hostname    string
-	ForwardZone string
-	ReverseZone string
-	Nameserver  string
-	TSIGFile    string
-	TTL         int
-	TSIG        TSIG
+	Action     string
+	IP         net.IP
+	Hostname   string
+	Zone       string
+	Nameserver string
+	TTL        int
+	TSIG       TSIG
 }
 
 // DNSProvider is an implementation of the challenge.Provider interface that
 // uses dynamic DNS updates (RFC 2136) to create TXT records on a nameserver.
 type DNSProvider struct {
 	config *Config
+}
+
+func (d *DNSProvider) printConfig() {
+	fmt.Printf("%+v\n", d.config)
 }
 
 func stringInSlice(a string, list []string) bool {
@@ -54,54 +56,61 @@ func isIpv4(host string) bool {
 }
 
 // Parse Key as defined at https://ftp.isc.org/isc/bind/9.11.4/doc/arm/Bv9ARM.ch06.html#key_grammar
+/*
+	key string {
+		algorithm string;
+		secret string;
+	};
+*/
 func parseBindKey(keyFilePath string) (tsig TSIG, err error) {
-	err = nil
+	content, err := ioutil.ReadFile(keyFilePath)
+	keyText := string(content)
+	re := regexp.MustCompile(`key\s+"(?P<keyname>[^"]+)"\s+{\n?\s+algorithm\s+(?P<alg>[^;]+);\n?\s+secret\s+"(?P<secret>[^"]+)";\n?};`)
+
+	tsigString := re.FindStringSubmatch(keyText)
+	if tsigString == nil {
+		err = errors.New("Could not parse keyfile")
+		return
+	}
+
+	switch tsigString[2] {
+	case "hmac-md5":
+		tsig = TSIG{tsigString[1], "hmac-md5.sig-alg.reg.int.", tsigString[3]}
+	case "hmac-sha1":
+		tsig = TSIG{tsigString[1], "hmac-sha1.", tsigString[3]}
+	case "hmac-sha256":
+		tsig = TSIG{tsigString[1], "hmac-sha256.", tsigString[3]}
+	}
 	return
 }
 
-// GetRecord returns a DNS record which will fulfill the `dns-01` challenge
-func getRecord(domain, keyAuth string) (fqdn string, value string) {
-	keyAuthShaBytes := sha256.Sum256([]byte(keyAuth))
-	// base64URL encoding without padding
-	value = base64.RawURLEncoding.EncodeToString(keyAuthShaBytes[:sha256.Size])
-	fqdn = fmt.Sprintf("_acme-challenge.%s.", domain)
-
-	if ok, _ := strconv.ParseBool(os.Getenv("CNAME")); ok {
-		r, err := dnsQuery(fqdn, dns.TypeCNAME, recursiveNameservers, true)
-		// Check if the domain has CNAME then return that
-		if err == nil && r.Rcode == dns.RcodeSuccess {
-			fqdn = updateDomainWithCName(r, fqdn)
+func getDefaultIP() (ip string) {
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			return ip.String()
 		}
 	}
-
 	return
 }
 
-// Present creates a A record using the specified parameters
-func (d *DNSProvider) present(domain, token, keyAuth string) error {
-	fqdn, value := getRecord(domain, keyAuth)
-
-	err := d.changeRecord("INSERT", fqdn, value, d.config.TTL)
-	if err != nil {
-		return fmt.Errorf("rfc2136: failed to insert: %w", err)
-	}
-	return nil
+func getDefautHostname() (hostname string) {
+	hostname, _ = os.Hostname()
+	return hostname
 }
 
-// CleanUp removes the A record matching the specified parameters
-func (d *DNSProvider) cleanUp(domain, token, keyAuth string) error {
-	fqdn, value := getRecord(domain, keyAuth)
-
-	err := d.changeRecord("REMOVE", fqdn, value, d.config.TTL)
-	if err != nil {
-		return fmt.Errorf("rfc2136: failed to remove: %w", err)
-	}
-	return nil
-}
-
-func (d *DNSProvider) changeRecord(fqdn string, ip net.IP) error {
-	// Find the zone for the given fqdn
-	zone := d.config.ForwardZone
+func (d *DNSProvider) changeRecord() error {
+	zone := d.config.Zone
+	fqdn := d.config.Hostname
+	ip := d.config.IP
 
 	// Create RR
 	rr := new(dns.A)
@@ -121,9 +130,9 @@ func (d *DNSProvider) changeRecord(fqdn string, ip net.IP) error {
 	c.SingleInflight = true
 
 	// TSIG authentication / msg signing
-	if len(d.config.TSIGKey) > 0 && len(d.config.TSIGSecret) > 0 {
-		m.SetTsig(dns.Fqdn(d.config.TSIGKey), d.config.TSIGAlgorithm, 300, time.Now().Unix())
-		c.TsigSecret = map[string]string{dns.Fqdn(d.config.TSIGKey): d.config.TSIGSecret}
+	if len(d.config.TSIG.TSIGKey) > 0 && len(d.config.TSIG.TSIGSecret) > 0 {
+		m.SetTsig(dns.Fqdn(d.config.TSIG.TSIGKey), d.config.TSIG.TSIGAlgorithm, 300, time.Now().Unix())
+		c.TsigSecret = map[string]string{dns.Fqdn(d.config.TSIG.TSIGKey): d.config.TSIG.TSIGSecret}
 	}
 
 	// Send the query
@@ -138,60 +147,77 @@ func (d *DNSProvider) changeRecord(fqdn string, ip net.IP) error {
 	return nil
 }
 
-func sanitizeConfig(config Config) error {
-	var actions = []string{"add", "delete", "update"}
-	if !(stringInSlice(config.Action, actions)) {
-		return errors.New("Action, either 'add', 'delete' or 'update' [default: update]")
+func sanitizeConfig(action string, ip string, hostname string, zone string, nameserver string, nsPort int, tsigFile string, ttl int) (config Config, err error) {
+	if !(stringInSlice(action, []string{"add", "delete", "update"})) {
+		err = errors.New("Action, either 'add', 'delete' or 'update' [default: update]")
 	}
-	if !(isIpv4(config.IP)) {
-		return errors.New("ip is not a valid IPv4 IP")
+	ipAddr := net.ParseIP(ip)
+	if ipAddr == nil {
+		err = fmt.Errorf("ip: %q is not a valid IPv4 IP", ip)
 	}
-	if !(isIpv4(config.Nameserver)) {
-		return errors.New("nameserver is not a valid IPv4 IP")
+	if config.Hostname == "" {
+		err = errors.New("could not get hostname")
 	}
-	if config.Hostname == "" || config.ForwardZone == "" || config.ReverseZone == "" {
-		return errors.New("please set hostname, forwadzone and reversezone")
+	if config.Zone == "" {
+		err = errors.New("Set a zone [--zone ] or env NSUPDATE_ZONE")
 	}
+	if i := net.ParseIP(nameserver); i != nil {
+		nameserver = net.JoinHostPort(nameserver, strconv.Itoa(nsPort))
+	} else {
+		nameserver = dns.Fqdn(nameserver) + ":" + strconv.Itoa(nsPort)
+	}
+	_, err = os.Stat(tsigFile)
+	tsig, err := parseBindKey(tsigFile)
 
-	return nil
+	config = Config{action, ipAddr, hostname, dns.Fqdn(zone), nameserver, ttl, tsig}
+	return
 }
 
-func updateDNS(config Config) error {
-	return nil
+func newDNSClient(config Config) (*DNSProvider, error) {
+	var provider = DNSProvider{&config}
+	return &provider, nil
 }
 
 func main() {
 	var (
-		action      string
-		ip          string
-		hostname    string
-		nameserver  string
-		forwardZone string
-		reverseZone string
-		tsigFile    string
-		ttl         int
-		debug       bool
-		err         error
+		action     string
+		ip         string
+		hostname   string
+		nameserver string
+		nsPort     int
+		zone       string
+		tsigFile   string
+		ttl        int
+		debug      bool
+		err        error
 	)
 
 	flag.StringVar(&action, "action", "update", "Action, either 'add', 'delete' or 'update' [default: update]")
-	flag.StringVar(&ip, "ip", "", "Client IP Adress")
-	flag.StringVar(&hostname, "hostname", "", "Client Hostname")
+	flag.StringVar(&ip, "ip", getDefaultIP(), "Client IP Adress")
+	flag.StringVar(&hostname, "hostname", getDefautHostname(), "Client Hostname")
 	flag.StringVar(&nameserver, "nameserver", "127.0.0.1", "Nameserver to send the update to [default: 127.0.0.1]")
-	flag.StringVar(&forwardZone, "forwardZone", "", "DNS Zone to Add A Record for the Client")
+	flag.IntVar(&nsPort, "nsport", 53, "Port of the Nameserver to send the update to [default: 53]")
+	flag.StringVar(&zone, "zone", os.Getenv("NSUPDATE_ZONE"), "DNS Zone to Add A Record for the Client")
 	flag.IntVar(&ttl, "ttl", 600, "RR TTL")
-	flag.StringVar(&reverseZone, "reverseZone", "", "DNS ReverseZone to Add PTR Record for the Client")
-	flag.StringVar(&tsigFile, "tsigFile", "", "File holding the tsig key")
+	flag.StringVar(&tsigFile, "tsigFile", "/etc/rndc.key", "File holding the tsig key")
 
 	flag.BoolVar(&debug, "debug", false, "Run in Debug mode")
 	flag.Parse()
 
-	var config = Config{action, ip, hostname, forwardZone, reverseZone, nameserver, tsigFile, ttl, nil}
-	err = sanitizeConfig(config)
+	config, err := sanitizeConfig(action, ip, hostname, zone, nameserver, nsPort, tsigFile, ttl)
 	if err != nil {
 		panic(err)
 	}
-	err = updateDNS(config)
+
+	dnsclient, err := newDNSClient(config)
+	if err != nil {
+		panic(err)
+	}
+	if debug {
+		dnsclient.printConfig()
+	}
+
+	err = dnsclient.changeRecord()
 	if err != nil {
 		panic(err)
 	}
